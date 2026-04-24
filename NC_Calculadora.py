@@ -510,82 +510,131 @@ with tabs[4]:
 with tabs[5]:
     st.header("🧾 Notas Fiscais - NC Portas")
 
-    # Sheet selector menu
+    # --- View mode selector: single sheet or combined search ---
     nf_sheet_options = list(db._NF_SHEETS.keys())   # ["NF-e NC", "NFS-e NC"]
-    nf_sheet_key = st.radio(
+    nf_view_options  = nf_sheet_options + ["🔎 Busca Combinada (NF-e + NFS-e)"]
+    nf_view_key      = st.radio(
         "Selecionar Tabela",
-        options=nf_sheet_options,
+        options=nf_view_options,
         horizontal=True,
-        key="nf_sheet_sel",
+        key="nf_view_sel",
     )
+    is_combined = nf_view_key == nf_view_options[-1]
 
     st.write("---")
 
-    # Search bar
+    # Search bar + CHAVE toggle (CHAVE toggle only relevant for single-sheet views)
     col_search, col_toggle = st.columns([4, 1])
-    nf_query    = col_search.text_input(
+    nf_query   = col_search.text_input(
         "🔍 Buscar por OS, Cliente ou Número da Nota",
         placeholder="Ex: 427  |  Mondelez  |  5011",
         key="nf_query",
     )
-    show_chave  = col_toggle.toggle("Mostrar CHAVE", value=False, key="nf_show_chave")
+    show_chave = col_toggle.toggle(
+        "Mostrar CHAVE", value=False, key="nf_show_chave",
+        disabled=is_combined,   # CHAVE not in combined view
+    )
 
-    # Load and filter data
-    df_nf = db.search_nf_sheet(nf_sheet_key, nf_query)
+    # CSS: center OS, TIPO, NOTA, NF-e, NFS-e, DPS columns.
+    # Red text rows for STATUS = Cancelada rendered via st.dataframe styling below.
+    st.markdown("""
+        <style>
+        [data-testid="stDataFrame"] td:first-child,
+        [data-testid="stDataFrame"] th:first-child { text-align: center !important; }
+        </style>
+    """, unsafe_allow_html=True)
 
-    if df_nf.empty:
-        st.warning("Nenhum resultado encontrado." if nf_query else "Nenhum dado disponível.")
-    else:
-        # Build display columns — hide CHAVE unless toggled on
-        all_cols      = df_nf.columns.tolist()
-        hide_cols     = ["CHAVE"] if not show_chave else []
-        display_cols  = [c for c in all_cols if c not in hide_cols]
-        df_display    = df_nf[display_cols].copy()
+    # --- COMBINED VIEW ---
+    if is_combined:
+        if not nf_query.strip():
+            st.info("Digite um termo para buscar em NF-e NC e NFS-e NC simultaneamente.")
+        else:
+            df_combined = db.search_nf_combined(nf_query)
+            if df_combined.empty:
+                st.warning("Nenhum resultado encontrado.")
+            else:
+                df_display = df_combined.copy()
 
-        # Apply Brazilian currency format (R$ 0.000,00) using format_real.
-        # Columns are converted to string so Streamlit renders them as-is.
-        currency_cols = db._NF_SHEETS[nf_sheet_key]["currency_cols"]
-        for col in currency_cols:
-            if col in df_display.columns:
-                df_display[col] = df_display[col].apply(
-                    lambda v: eng.format_real(float(v)) if v == v and v is not None else ""
+                # Format currency columns
+                for col in ["TOTAL OS", "VALOR"]:
+                    if col in df_display.columns:
+                        df_display[col] = df_display[col].apply(
+                            lambda v: eng.format_real(float(v)) if v == v and v is not None else ""
+                        )
+
+                # Red text for Cancelada rows via Pandas Styler
+                def _style_cancelada(row):
+                    color = "color: red;" if str(row.get("STATUS", "")).strip() == "Cancelada" else ""
+                    return [color] * len(row)
+
+                styled = df_display.style.apply(_style_cancelada, axis=1)
+
+                col_cfg_comb = {
+                    "OS":   st.column_config.TextColumn("OS",   width="small"),
+                    "TIPO": st.column_config.TextColumn("TIPO", width="small"),
+                    "NOTA": st.column_config.TextColumn("NOTA", width="small"),
+                }
+
+                row_height = 35; header_h = 38; max_height = 900
+                tbl_height = min(len(df_display) * row_height + header_h, max_height)
+                st.caption(f"{len(df_display)} registro(s) encontrado(s)")
+                st.dataframe(
+                    styled,
+                    hide_index=True,
+                    use_container_width=True,
+                    height=tbl_height,
+                    column_config=col_cfg_comb,
                 )
 
-        # CSS injection: center OS column, left-align currency columns.
-        # Targets st.dataframe internal classes — stable across current Streamlit versions.
-        st.markdown("""
-            <style>
-            /* Center OS column (first data cell and header) */
-            [data-testid="stDataFrame"] td:first-child,
-            [data-testid="stDataFrame"] th:first-child { text-align: center !important; }
-            </style>
-        """, unsafe_allow_html=True)
+    # --- SINGLE SHEET VIEW ---
+    else:
+        nf_sheet_key  = nf_view_key
+        df_nf         = db.search_nf_sheet(nf_sheet_key, nf_query)
 
-        # column_config: OS as small text, currency cols as left-aligned text
-        col_cfg = {
-            "OS": st.column_config.TextColumn("OS", width="small"),
-        }
-        for col in currency_cols:
-            if col in display_cols:
-                col_cfg[col] = st.column_config.TextColumn(col)
+        if df_nf.empty:
+            st.warning("Nenhum resultado encontrado." if nf_query else "Nenhum dado disponível.")
+        else:
+            # Hide CHAVE unless toggled on
+            all_cols     = df_nf.columns.tolist()
+            hide_cols    = ["CHAVE"] if not show_chave else []
+            display_cols = [c for c in all_cols if c not in hide_cols]
+            df_display   = df_nf[display_cols].copy()
 
-        # Dynamic height: 35px per row + 38px header, capped at 900px
-        row_height  = 35
-        header_h    = 38
-        max_height  = 900
-        tbl_height  = min(len(df_display) * row_height + header_h, max_height)
+            # Currency formatting
+            currency_cols = db._NF_SHEETS[nf_sheet_key]["currency_cols"]
+            for col in currency_cols:
+                if col in df_display.columns:
+                    df_display[col] = df_display[col].apply(
+                        lambda v: eng.format_real(float(v)) if v == v and v is not None else ""
+                    )
 
-        # Result count
-        st.caption(f"{len(df_display)} registro(s) encontrado(s)")
+            # Red text for Cancelada rows
+            def _style_cancelada_single(row):
+                color = "color: red;" if str(row.get("STATUS", "")).strip() == "Cancelada" else ""
+                return [color] * len(row)
 
-        # Render table
-        st.dataframe(
-            df_display,
-            hide_index=True,
-            use_container_width=True,
-            height=tbl_height,
-            column_config=col_cfg,
-        )
+            styled = df_display.style.apply(_style_cancelada_single, axis=1)
+
+            # column_config: center-aligned columns, currency as text
+            _center_cols = ["OS", "NF-e", "NFS-e", "DPS"]
+            col_cfg = {}
+            for col in _center_cols:
+                if col in display_cols:
+                    col_cfg[col] = st.column_config.TextColumn(col, width="small")
+            for col in currency_cols:
+                if col in display_cols:
+                    col_cfg[col] = st.column_config.TextColumn(col)
+
+            row_height = 35; header_h = 38; max_height = 900
+            tbl_height = min(len(df_display) * row_height + header_h, max_height)
+            st.caption(f"{len(df_display)} registro(s) encontrado(s)")
+            st.dataframe(
+                styled,
+                hide_index=True,
+                use_container_width=True,
+                height=tbl_height,
+                column_config=col_cfg,
+            )
     # --- REPORT GENERATOR ---
     st.write("---")
     st.subheader("📊 Gerar Relatório Mensal")
