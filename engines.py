@@ -145,89 +145,116 @@ def gerar_pdf_orcamento(dados, servicos, produtos, obs):
     return bytes(pdf_out) if isinstance(pdf_out, bytearray) else pdf_out.encode('latin-1')
 
 # --- SECTION: EXCEL REPORT GENERATION ---
-# Template paths — model files must sit alongside this module in production.
-# The _inject_cf helper post-processes the openpyxl ZIP output to:
-#   1. Replace styles.xml and theme1.xml with the model's versions (preserves
-#      all DXF entries, theme colors, fonts, and number formats exactly).
-#   2. Inject conditional formatting XML into the sheet XML.
-# This is necessary because openpyxl cannot write theme-referenced colors or
-# DXF-based conditional formatting without corrupting the file.
+# Generates monthly invoice reports by writing raw sheet XML and copying all
+# styles, theme, and assets directly from the model files. This guarantees
+# pixel-perfect output — no openpyxl style mapping, no index mismatch.
+#
+# DEPENDENCY: The two model files must sit in the same folder as this module:
+#   NC_Portas_-_NFe_-_Relatório_Março.xlsx
+#   NC_Portas_-_NFSe_-_Relatório_Março.xlsx
 
-import io, os, zipfile, re as _re
-_BASE = os.path.dirname(__file__)
+import io as _io, os as _os, zipfile as _zipfile, re as _re, xml.sax.saxutils as _saxutils
 
-_NFE_TEMPLATE  = os.path.join(_BASE, "NC_Portas_-_NFe_-_Relatório_Março.xlsx")
-_NFSE_TEMPLATE = os.path.join(_BASE, "NC_Portas_-_NFSe_-_Relatório_Março.xlsx")
+_BASE          = _os.path.dirname(__file__)
+_NFE_TEMPLATE  = _os.path.join(_BASE, "NC_Portas_-_NFe_-_Relatório_Março.xlsx")
+_NFSE_TEMPLATE = _os.path.join(_BASE, "NC_Portas_-_NFSe_-_Relatório_Março.xlsx")
 
 
-def _inject_styles_and_cf(xlsx_bytes, template_path, cf_xml, last_data_row):
-    """Post-processes an openpyxl-generated xlsx buffer:
-    - Replaces styles.xml and theme1.xml with those from template_path.
-    - Injects cf_xml into the sheet XML after </sheetData>.
-    - Updates the table ref to cover rows 1..last_data_row.
+def _esc(val):
+    """XML-escape a cell value string."""
+    return _saxutils.escape(str(val)) if val is not None else ""
 
-    Args:
-        xlsx_bytes:    bytes from openpyxl wb.save()
-        template_path: path to the model .xlsx file
-        cf_xml:        str — full conditionalFormatting XML block(s) to inject
-        last_data_row: int — last row with data (for table ref update)
 
-    Returns:
-        bytes: patched xlsx content
+def _build_xlsx(template_path, sheet_title, sheet_xml_bytes, table_xml_bytes):
+    """Assembles the final .xlsx by copying all assets from the template
+    and replacing only the sheet and table XML with new content.
+
+    Returns bytes.
     """
-    # Read template assets
-    with zipfile.ZipFile(template_path, 'r') as tmpl:
-        styles_xml = tmpl.read('xl/styles.xml')
-        theme_xml  = tmpl.read('xl/theme/theme1.xml')
+    buf = _io.BytesIO()
+    with _zipfile.ZipFile(template_path, 'r') as src, \
+         _zipfile.ZipFile(buf, 'w', compression=_zipfile.ZIP_DEFLATED) as dst:
 
-    # Read generated file and patch it
-    src  = io.BytesIO(xlsx_bytes)
-    dest = io.BytesIO()
+        for item in src.infolist():
+            data = src.read(item.filename)
 
-    with zipfile.ZipFile(src, 'r') as zin, \
-         zipfile.ZipFile(dest, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            # Skip calcChain — it caches formula order from the template's row
+            # coordinates. Copying it causes Excel repair errors when row count
+            # differs from the model. Excel rebuilds it automatically on open.
+            if item.filename == 'xl/calcChain.xml':
+                continue
 
-        for item in zin.infolist():
-            data = zin.read(item.filename)
-
-            if item.filename == 'xl/styles.xml':
-                data = styles_xml
-
-            elif item.filename == 'xl/theme/theme1.xml':
-                data = theme_xml
-
-            elif item.filename.startswith('xl/worksheets/sheet') and item.filename.endswith('.xml'):
-                text = data.decode('utf-8')
-                # Inject CF after </sheetData> (before <pageMargins or end of worksheet)
-                insert_point = '</sheetData>'
-                if insert_point in text:
-                    # Remove any CF blocks openpyxl may have written
-                    text = _re.sub(r'<conditionalFormatting.*?</conditionalFormatting>', '',
-                                   text, flags=_re.DOTALL)
-                    text = text.replace(insert_point,
-                                        insert_point + cf_xml, 1)
-                data = text.encode('utf-8')
-
+            if item.filename == 'xl/worksheets/sheet1.xml':
+                data = sheet_xml_bytes
             elif 'xl/tables/' in item.filename:
-                # Update table ref to match actual data range
-                text = data.decode('utf-8')
-                # Replace ref="A1:X<old_row>" with correct last row
-                text = _re.sub(r'ref="(A1:[A-Z]+)\d+"',
-                               lambda m: f'ref="{m.group(1)}{last_data_row}"', text)
-                # Also fix autoFilter ref
-                text = _re.sub(r'(<autoFilter ref="A1:[A-Z]+)\d+"',
-                               lambda m: f'{m.group(1)}{last_data_row}"', text)
-                data = text.encode('utf-8')
+                data = table_xml_bytes
+            elif item.filename == 'xl/workbook.xml':
+                # Update sheet title
+                data = _re.sub(
+                    rb'name="[^"]*"',
+                    f'name="{sheet_title}"'.encode(),
+                    data, count=1
+                )
 
-            zout.writestr(item, data)
+            dst.writestr(item, data)
 
-    return dest.getvalue()
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# NF-e NC
+# ---------------------------------------------------------------------------
+# Exact style indices from model NF-e styles.xml:
+#   Row stripe A (white fill=0): cols A-H → s= 1  2  3  4  3  5  6  7
+#   Row stripe B (grey  fill=2): cols A-H → s= 8  9 10 11 10 12 13 14
+#   Header row:                  cols A-H → s=37 38 39 40 39 41 42 43
+#   Footer label col A:  s=34   Footer value col B: qty=35, total=36
+
+_NFE_HDR_S  = [37, 38, 39, 40, 39, 41, 42, 43]   # header row, 8 cols
+_NFE_ROW_A  = [ 1,  2,  3,  4,  3,  5,  6,  7]   # odd  data rows (white)
+_NFE_ROW_B  = [ 8,  9, 10, 11, 10, 12, 13, 14]   # even data rows (grey)
+
+_NFE_COLS_XML = (
+    '<cols>'
+    '<col min="1" max="1" width="52.625" bestFit="1" customWidth="1"/>'
+    '<col min="2" max="2" width="16.125" bestFit="1" customWidth="1"/>'
+    '<col min="3" max="3" width="19.625" bestFit="1" customWidth="1"/>'
+    '<col min="4" max="4" width="10.875" bestFit="1" customWidth="1"/>'
+    '<col min="5" max="5" width="58.875" bestFit="1" customWidth="1"/>'
+    '<col min="6" max="6" width="52.5"   bestFit="1" customWidth="1"/>'
+    '<col min="7" max="7" width="14.125" bestFit="1" customWidth="1"/>'
+    '<col min="8" max="8" width="13.5"   bestFit="1" customWidth="1"/>'
+    '</cols>'
+)
+
+_NFE_SHEET_VIEW = (
+    '<sheetViews>'
+    '<sheetView showGridLines="0" tabSelected="1" zoomScale="90" zoomScaleNormal="90" workbookViewId="0">'
+    '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+    '<selection pane="bottomLeft"/>'
+    '</sheetView>'
+    '</sheetViews>'
+)
+
+_NFE_COLS = ["CLIENTE", "NF-e", "VALOR NF-e", "CFOP", "NATUREZA", "CHAVE", "EMISSÃO", "STATUS"]
+_NFE_DFCOLS = ["CLIENTE", "NF-e", "VALOR NF-e", "CFOP", "NATUREZA", "CHAVE", "EMISSÃO", "STATUS"]
+
+
+def _nfe_cell(col_idx, row, val, s, is_numeric=False, is_date=False):
+    """Render a single <c> element. col_idx is 0-based."""
+    col_letters = ["A","B","C","D","E","F","G","H"]
+    ref = f"{col_letters[col_idx]}{row}"
+    if is_numeric and val != "" and val is not None:
+        return f'<c r="{ref}" s="{s}"><v>{val}</v></c>'
+    elif is_date and val != "" and val is not None:
+        return f'<c r="{ref}" s="{s}"><v>{val}</v></c>'
+    else:
+        v = _esc(val)
+        return f'<c r="{ref}" s="{s}" t="inlineStr"><is><t xml:space="preserve">{v}</t></is></c>'
 
 
 def gerar_relatorio_nfe(df, mes_ano):
-    """Generates the NF-e NC monthly report Excel file in memory.
-    Formatting, fonts, theme colors and conditional formatting are copied
-    exactly from the model file.
+    """Generates the NF-e NC monthly report Excel file with exact model formatting.
 
     Args:
         df:      DataFrame filtered for the target month.
@@ -236,111 +263,177 @@ def gerar_relatorio_nfe(df, mes_ano):
     Returns:
         bytes: raw .xlsx content ready for st.download_button
     """
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-    from openpyxl.utils import get_column_letter
-    from openpyxl.worksheet.table import Table, TableStyleInfo
+    import pandas as pd
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "NF-e NC"
+    last_data_row = len(df) + 1   # row 1 = header, data starts row 2
+    n_cols        = 8
+    col_letters   = "ABCDEFGH"
 
-    # (header, df_col, width, h_align, d_align)
-    COL_DEFS = [
-        ("CLIENTE",    "CLIENTE",    52.625, "left",   "left"),
-        ("NF-e",       "NF-e",       16.125, "center", "center"),
-        ("VALOR NF-e", "VALOR NF-e", 19.625, "center", "center"),
-        ("CFOP",       "CFOP",       10.875, "center", "center"),
-        ("NATUREZA",   "NATUREZA",   58.875, "center", "center"),
-        ("CHAVE",      "CHAVE",      52.5,   "center", "center"),
-        ("EMISSÃO",    "EMISSÃO",    14.125, "center", "center"),
-        ("STATUS",     "STATUS",     13.5,   "center", "center"),
-    ]
+    # --- Header row ---
+    hdr_cells = ""
+    for ci, (hdr, s) in enumerate(zip(_NFE_COLS, _NFE_HDR_S)):
+        ref = f"{col_letters[ci]}1"
+        hdr_cells += f'<c r="{ref}" s="{s}" t="inlineStr"><is><t>{_esc(hdr)}</t></is></c>'
+    header_row = (
+        f'<row r="1" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'{hdr_cells}</row>'
+    )
 
-    _thick  = Side(border_style="thick")
-    _medium = Side(border_style="medium")
-    _none   = Side(border_style=None)
-    _col_left = {2: _thick, 4: _medium, 6: _medium, 8: _medium}
-
-    for i, (_, _, w, _, _) in enumerate(COL_DEFS, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.sheet_format.defaultRowHeight = 16.5
-
-    # Header
-    for ci, (hdr, _, _, ha, _) in enumerate(COL_DEFS, 1):
-        cell = ws.cell(row=1, column=ci, value=hdr)
-        cell.font      = Font(bold=True)
-        cell.alignment = Alignment(horizontal=ha)
-        cell.border    = Border(left=_col_left.get(ci, _none))
-
-    # Data rows (fills are placeholders — replaced by template styles.xml)
-    fill_w = PatternFill("solid", fgColor="FFFFFF")
-    fill_g = PatternFill("solid", fgColor="F2F2F2")
-
+    # --- Data rows ---
+    data_rows = ""
     for ri, (_, row) in enumerate(df.iterrows()):
-        er   = ri + 2
-        fill = fill_w if ri % 2 == 0 else fill_g
-        for ci, (_, col, _, _, da) in enumerate(COL_DEFS, 1):
+        er  = ri + 2
+        idx = _NFE_ROW_A if ri % 2 == 0 else _NFE_ROW_B
+        cells = ""
+
+        for ci, col in enumerate(_NFE_DFCOLS):
+            s   = idx[ci]
             val = row.get(col, "")
-            if col == "EMISSÃO" and hasattr(val, "strftime"):
-                val = val.strftime("%d/%m/%Y")
-            elif col == "EMISSÃO" and val == val and val:
-                import pandas as pd
-                try: val = pd.to_datetime(val).strftime("%d/%m/%Y")
-                except Exception: pass
-            cell = ws.cell(row=er, column=ci,
-                           value=(val if val == val else ""))
-            cell.alignment = Alignment(horizontal=da)
-            cell.fill      = fill
-            cell.border    = Border(left=_col_left.get(ci, _none))
 
-    last_data_row = len(df) + 1
+            if col == "EMISSÃO":
+                # Convert to Excel serial date number
+                try:
+                    dt = pd.to_datetime(val)
+                    serial = (dt - pd.Timestamp("1899-12-30")).days
+                    cells += f'<c r="{col_letters[ci]}{er}" s="{s}"><v>{serial}</v></c>'
+                except Exception:
+                    cells += f'<c r="{col_letters[ci]}{er}" s="{s}" t="inlineStr"><is><t>{_esc(val)}</t></is></c>'
+            elif col in ("NF-e", "VALOR NF-e", "CFOP"):
+                try:
+                    cells += f'<c r="{col_letters[ci]}{er}" s="{s}"><v>{float(val)}</v></c>'
+                except Exception:
+                    cells += f'<c r="{col_letters[ci]}{er}" s="{s}" t="inlineStr"><is><t>{_esc(val)}</t></is></c>'
+            else:
+                v = _esc(str(val).strip()) if val == val and val is not None else ""
+                cells += f'<c r="{col_letters[ci]}{er}" s="{s}" t="inlineStr"><is><t xml:space="preserve">{v}</t></is></c>'
 
-    # Table
-    tbl = Table(displayName="NFe", ref=f"A1:H{last_data_row}")
-    tbl.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium15", showFirstColumn=False,
-        showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-    ws.add_table(tbl)
+        data_rows += (
+            f'<row r="{er}" spans="1:{n_cols}" x14ac:dyDescent="0.3">'
+            f'{cells}</row>'
+        )
 
-    # Footer (skip 1 blank row)
-    fr      = last_data_row + 2
-    _bold   = Font(bold=True)
-    _mb     = Border(left=_medium, right=_medium, top=_medium, bottom=_medium)
-    for label, formula, r in [
-        ("Quantidade Notas", f"=COUNT(NFe[NF-e])",     fr),
-        ("Valor Total",      f"=SUM(NFe[VALOR NF-e])", fr + 1),
-    ]:
-        c1 = ws.cell(row=r, column=1, value=label)
-        c1.font = _bold; c1.border = _mb
-        c2 = ws.cell(row=r, column=2, value=formula)
-        c2.font = _bold; c2.border = _mb
-        c2.alignment = Alignment(horizontal="center")
+    # --- Blank separator row and footer rows ---
+    blank_row   = last_data_row + 1
+    footer_row1 = last_data_row + 2
+    footer_row2 = last_data_row + 3
 
-    # Save to buffer then inject template styling + CF
-    buf = io.BytesIO()
-    wb.save(buf)
-    raw = buf.getvalue()
+    footer = (
+        f'<row r="{blank_row}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35"/>'
+        f'<row r="{footer_row1}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'<c r="A{footer_row1}" s="34" t="inlineStr"><is><t>Quantidade Notas</t></is></c>'
+        f'<c r="B{footer_row1}" s="35"><f>COUNT(NFe[NF-e])</f><v>0</v></c>'
+        f'</row>'
+        f'<row r="{footer_row2}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'<c r="A{footer_row2}" s="34" t="inlineStr"><is><t>Valor Total</t></is></c>'
+        f'<c r="B{footer_row2}" s="36"><f>SUM(NFe[VALOR NF-e])</f><v>0</v></c>'
+        f'</row>'
+    )
 
-    # Conditional formatting XML (sqref updated to match actual data range)
+    # --- Conditional formatting (sqref covers data rows only) ---
     cf_xml = (
         f'<conditionalFormatting sqref="B2:H{last_data_row}">'
-        f'<cfRule type="expression" dxfId="2" priority="1">'
-        f'<formula>$H2="Em Andamento"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="1" priority="2">'
-        f'<formula>$H2="Emitida"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="0" priority="3">'
-        f'<formula>$H2="Cancelada"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="2" priority="1"><formula>$H2="Em Andamento"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="1" priority="2"><formula>$H2="Emitida"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="0" priority="3"><formula>$H2="Cancelada"</formula></cfRule>'
         f'</conditionalFormatting>'
     )
 
-    return _inject_styles_and_cf(raw, _NFE_TEMPLATE, cf_xml, last_data_row)
+    # --- Assemble full sheet XML ---
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        ' xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac">'
+        f'{_NFE_SHEET_VIEW}'
+        '<sheetFormatPr defaultRowHeight="16.5" x14ac:dyDescent="0.3"/>'
+        f'{_NFE_COLS_XML}'
+        '<sheetData>'
+        f'{header_row}{data_rows}'
+        '</sheetData>'
+        '<phoneticPr fontId="4" type="noConversion"/>'
+        f'{cf_xml}'
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '</worksheet>'
+    )
+
+    # --- Table XML ---
+    table_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' id="1" name="NFe" displayName="NFe"'
+        f' ref="A1:H{last_data_row}" totalsRowShown="0">'
+        f'<autoFilter ref="A1:H{last_data_row}"/>'
+        '<tableColumns count="8">'
+        '<tableColumn id="1" name="CLIENTE"/>'
+        '<tableColumn id="3" name="NF-e" dataCellStyle="Currency"/>'
+        '<tableColumn id="4" name="VALOR NF-e" dataCellStyle="Currency"/>'
+        '<tableColumn id="5" name="CFOP" dataCellStyle="Currency"/>'
+        '<tableColumn id="6" name="NATUREZA" dataCellStyle="Currency"/>'
+        '<tableColumn id="7" name="CHAVE" dataCellStyle="Currency"/>'
+        '<tableColumn id="8" name="EMISSÃO"/>'
+        '<tableColumn id="9" name="STATUS"/>'
+        '</tableColumns>'
+        '<tableStyleInfo name="TableStyleMedium15" showFirstColumn="0"'
+        ' showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>'
+        '</table>'
+    )
+
+    return _build_xlsx(
+        _NFE_TEMPLATE,
+        "NF-e NC",
+        sheet_xml.encode("utf-8"),
+        table_xml.encode("utf-8"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# NFS-e NC
+# ---------------------------------------------------------------------------
+# Exact style indices from model NFS-e styles.xml:
+#   Row A (white): A=1  B=3  C=4  D=5  E=6  F=7  G=8  H=9  I=10 J=11 K=12 L=13 M=2
+#   Row B (grey):  A=13 B=16 C=17 D=18 E=19 F=20 G=21 H=22 I=23 J=24 K=25 L=26 M=15
+#   Header:        A=64 B=65 C=66 D=65 E=67 F=68 G=69 H=70 I=71 J=72 K=72 L=72 M=72
+#   Footer label s=60, qty s=61, valor s=62, liquido s=63
+
+_NFSE_HDR_S = [64, 65, 66, 65, 67, 68, 69, 70, 71, 72, 72, 72, 72]
+_NFSE_ROW_A = [ 1,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13,  2]
+_NFSE_ROW_B = [13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 15]
+
+_NFSE_COLS_XML = (
+    '<cols>'
+    '<col min="1"  max="1"  width="49.625" bestFit="1" customWidth="1"/>'
+    '<col min="2"  max="2"  width="15"     bestFit="1" customWidth="1"/>'
+    '<col min="3"  max="3"  width="20.625" bestFit="1" customWidth="1"/>'
+    '<col min="4"  max="4"  width="9.125"  bestFit="1" customWidth="1"/>'
+    '<col min="5"  max="5"  width="58.875" bestFit="1" customWidth="1"/>'
+    '<col min="6"  max="6"  width="11.375" bestFit="1" customWidth="1"/>'
+    '<col min="7"  max="7"  width="13.25"  bestFit="1" customWidth="1"/>'
+    '<col min="8"  max="8"  width="19.125" bestFit="1" customWidth="1"/>'
+    '<col min="9"  max="9"  width="15.25"  bestFit="1" customWidth="1"/>'
+    '<col min="10" max="10" width="12.125" bestFit="1" customWidth="1"/>'
+    '<col min="11" max="11" width="18.875" bestFit="1" customWidth="1"/>'
+    '<col min="12" max="12" width="13.875" bestFit="1" customWidth="1"/>'
+    '<col min="13" max="13" width="23.625" bestFit="1" customWidth="1"/>'
+    '</cols>'
+)
+
+_NFSE_SHEET_VIEW = (
+    '<sheetViews>'
+    '<sheetView showGridLines="0" tabSelected="1" zoomScale="90" zoomScaleNormal="90" workbookViewId="0">'
+    '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+    '<selection pane="bottomLeft"/>'
+    '</sheetView>'
+    '</sheetViews>'
+)
+
+_NFSE_COLS    = ["CLIENTE","NFS-e","VALOR NFS-e","DPS","CHAVE","DATA","STATUS",
+                 "OBSERVAÇÕES","RETER ISS","ISS","RETER INSS","INSS","VALOR LIQUIDO"]
+_NFSE_NUMERIC = {"NFS-e","VALOR NFS-e","DPS","ISS","INSS","VALOR LIQUIDO"}
+_NFSE_LETTERS = list("ABCDEFGHIJKLM")
 
 
 def gerar_relatorio_nfse(df, mes_ano):
-    """Generates the NFS-e NC monthly report Excel file in memory.
-    Formatting, fonts, theme colors and conditional formatting are copied
-    exactly from the model file.
+    """Generates the NFS-e NC monthly report Excel file with exact model formatting.
 
     Args:
         df:      DataFrame filtered for the target month.
@@ -349,127 +442,145 @@ def gerar_relatorio_nfse(df, mes_ano):
     Returns:
         bytes: raw .xlsx content ready for st.download_button
     """
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
-    from openpyxl.utils import get_column_letter
-    from openpyxl.worksheet.table import Table, TableStyleInfo
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "NFS-e NC"
-
-    COL_DEFS = [
-        ("CLIENTE",       "CLIENTE",       49.625, "left",   "left"),
-        ("NFS-e",         "NFS-e",         15.0,   "center", "center"),
-        ("VALOR NFS-e",   "VALOR NFS-e",   20.625, "center", "center"),
-        ("DPS",           "DPS",           9.125,  "center", "center"),
-        ("CHAVE",         "CHAVE",         58.875, "center", "center"),
-        ("DATA",          "DATA",          11.375, "center", "center"),
-        ("STATUS",        "STATUS",        13.25,  "center", "center"),
-        ("OBSERVAÇÕES",   "OBSERVAÇÕES",   19.125, "left",   "left"),
-        ("RETER ISS",     "RETER ISS",     15.25,  "center", "center"),
-        ("ISS",           "ISS",           12.125, "center", "center"),
-        ("RETER INSS",    "RETER INSS",    18.875, "center", "center"),
-        ("INSS",          "INSS",          13.875, "center", "center"),
-        ("VALOR LIQUIDO", "VALOR LIQUIDO", 23.625, "center", "center"),
-    ]
-
-    _thick  = Side(border_style="thick")
-    _medium = Side(border_style="medium")
-    _none   = Side(border_style=None)
-    _col_left = {3: _medium, 5: _medium, 7: _medium, 9: _thick}
-
-    for i, (_, _, w, _, _) in enumerate(COL_DEFS, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.sheet_format.defaultRowHeight = 16.5
-
-    # Header
-    for ci, (hdr, _, _, ha, _) in enumerate(COL_DEFS, 1):
-        cell = ws.cell(row=1, column=ci, value=hdr)
-        cell.font      = Font(bold=True)
-        cell.alignment = Alignment(horizontal=ha)
-        cell.border    = Border(left=_col_left.get(ci, _none))
-
-    fill_w = PatternFill("solid", fgColor="FFFFFF")
-    fill_g = PatternFill("solid", fgColor="F2F2F2")
-
-    for ri, (_, row) in enumerate(df.iterrows()):
-        er   = ri + 2
-        fill = fill_w if ri % 2 == 0 else fill_g
-        for ci, (_, col, _, _, da) in enumerate(COL_DEFS, 1):
-            val = row.get(col, "")
-            if col == "DATA" and hasattr(val, "strftime"):
-                val = val.strftime("%d/%m/%Y")
-            elif col == "DATA" and val == val and val:
-                import pandas as pd
-                try: val = pd.to_datetime(val).strftime("%d/%m/%Y")
-                except Exception: pass
-            cell = ws.cell(row=er, column=ci,
-                           value=(val if val == val else ""))
-            cell.alignment = Alignment(horizontal=da)
-            cell.fill      = fill
-            cell.border    = Border(left=_col_left.get(ci, _none))
+    import pandas as pd
 
     last_data_row = len(df) + 1
+    n_cols        = 13
 
-    tbl = Table(displayName="NFSe", ref=f"A1:M{last_data_row}")
-    tbl.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium15", showFirstColumn=False,
-        showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-    ws.add_table(tbl)
+    # --- Header row ---
+    hdr_cells = ""
+    for ci, (hdr, s) in enumerate(zip(_NFSE_COLS, _NFSE_HDR_S)):
+        ref = f"{_NFSE_LETTERS[ci]}1"
+        hdr_cells += f'<c r="{ref}" s="{s}" t="inlineStr"><is><t>{_esc(hdr)}</t></is></c>'
+    header_row = (
+        f'<row r="1" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'{hdr_cells}</row>'
+    )
 
-    fr    = last_data_row + 2
-    _bold = Font(bold=True)
-    _mb   = Border(left=_medium, right=_medium, top=_medium, bottom=_medium)
-    for label, formula, r in [
-        ("Quantidade Notas", f"=COUNT(NFSe[NFS-e])",         fr),
-        ("Valor Total",      f"=SUM(NFSe[VALOR NFS-e])",     fr + 1),
-        ("Valor Liquido",    f"=SUM(NFSe[VALOR LIQUIDO])",   fr + 2),
-    ]:
-        c1 = ws.cell(row=r, column=1, value=label)
-        c1.font = _bold; c1.border = _mb
-        c2 = ws.cell(row=r, column=2, value=formula)
-        c2.font = _bold; c2.border = _mb
-        c2.alignment = Alignment(horizontal="center")
+    # --- Data rows ---
+    data_rows = ""
+    for ri, (_, row) in enumerate(df.iterrows()):
+        er  = ri + 2
+        idx = _NFSE_ROW_A if ri % 2 == 0 else _NFSE_ROW_B
+        cells = ""
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    raw = buf.getvalue()
+        for ci, col in enumerate(_NFSE_COLS):
+            s   = idx[ci]
+            val = row.get(col, "")
 
-    # 4 CF blocks with dynamic sqref
+            if col == "DATA":
+                try:
+                    dt     = pd.to_datetime(val)
+                    serial = (dt - pd.Timestamp("1899-12-30")).days
+                    cells += f'<c r="{_NFSE_LETTERS[ci]}{er}" s="{s}"><v>{serial}</v></c>'
+                except Exception:
+                    cells += f'<c r="{_NFSE_LETTERS[ci]}{er}" s="{s}" t="inlineStr"><is><t>{_esc(val)}</t></is></c>'
+            elif col in _NFSE_NUMERIC:
+                try:
+                    cells += f'<c r="{_NFSE_LETTERS[ci]}{er}" s="{s}"><v>{float(val)}</v></c>'
+                except Exception:
+                    cells += f'<c r="{_NFSE_LETTERS[ci]}{er}" s="{s}" t="inlineStr"><is><t>{_esc(val)}</t></is></c>'
+            else:
+                v = _esc(str(val).strip()) if val == val and val is not None else ""
+                cells += f'<c r="{_NFSE_LETTERS[ci]}{er}" s="{s}" t="inlineStr"><is><t xml:space="preserve">{v}</t></is></c>'
+
+        data_rows += (
+            f'<row r="{er}" spans="1:{n_cols}" x14ac:dyDescent="0.3">'
+            f'{cells}</row>'
+        )
+
+    # --- Footer ---
+    blank_row   = last_data_row + 1
+    fr1         = last_data_row + 2
+    fr2         = last_data_row + 3
+    fr3         = last_data_row + 4
+
+    footer = (
+        f'<row r="{blank_row}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35"/>'
+        f'<row r="{fr1}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'<c r="A{fr1}" s="60" t="inlineStr"><is><t>Quantidade Notas</t></is></c>'
+        f'<c r="B{fr1}" s="61"><f>COUNT(NFSe[NFS-e])</f><v>0</v></c>'
+        f'</row>'
+        f'<row r="{fr2}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'<c r="A{fr2}" s="60" t="inlineStr"><is><t>Valor Total</t></is></c>'
+        f'<c r="B{fr2}" s="62"><f>SUM(NFSe[VALOR NFS-e])</f><v>0</v></c>'
+        f'</row>'
+        f'<row r="{fr3}" spans="1:{n_cols}" ht="17.25" thickBot="1" x14ac:dyDescent="0.35">'
+        f'<c r="A{fr3}" s="60" t="inlineStr"><is><t>Valor Liquido</t></is></c>'
+        f'<c r="B{fr3}" s="63"><f>SUM(NFSe[VALOR LIQUIDO])</f><v>0</v></c>'
+        f'</row>'
+    )
+
+    # --- Conditional formatting ---
     cf_xml = (
-        # STATUS colors on columns B-H
         f'<conditionalFormatting sqref="B2:H{last_data_row}">'
-        f'<cfRule type="expression" dxfId="9" priority="8">'
-        f'<formula>$G2="Cancelada"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="8" priority="9">'
-        f'<formula>$G2="Substituida"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="7" priority="10">'
-        f'<formula>$G2="Emitida"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="9" priority="8"><formula>$G2="Cancelada"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="8" priority="9"><formula>$G2="Substituida"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="7" priority="10"><formula>$G2="Emitida"</formula></cfRule>'
         f'</conditionalFormatting>'
-        # RETER ISS colors on columns I-J
         f'<conditionalFormatting sqref="I2:J{last_data_row}">'
-        f'<cfRule type="expression" dxfId="6" priority="6">'
-        f'<formula>$I2="NÃO"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="5" priority="7">'
-        f'<formula>$I2="SIM"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="6" priority="6"><formula>$I2="NÃO"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="5" priority="7"><formula>$I2="SIM"</formula></cfRule>'
         f'</conditionalFormatting>'
-        # RETER INSS colors on columns K-L
         f'<conditionalFormatting sqref="K2:L{last_data_row}">'
-        f'<cfRule type="expression" dxfId="4" priority="4">'
-        f'<formula>$K2="NÃO"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="3" priority="5">'
-        f'<formula>$K2="SIM"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="4" priority="4"><formula>$K2="NÃO"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="3" priority="5"><formula>$K2="SIM"</formula></cfRule>'
         f'</conditionalFormatting>'
-        # VALOR LIQUIDO color on column M
         f'<conditionalFormatting sqref="M2:M{last_data_row}">'
-        f'<cfRule type="expression" dxfId="2" priority="1">'
-        f'<formula>$G2="Cancelada"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="1" priority="2">'
-        f'<formula>$G2="Substituida"</formula></cfRule>'
-        f'<cfRule type="expression" dxfId="0" priority="3">'
-        f'<formula>$G2="Emitida"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="2" priority="1"><formula>$G2="Cancelada"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="1" priority="2"><formula>$G2="Substituida"</formula></cfRule>'
+        f'<cfRule type="expression" dxfId="0" priority="3"><formula>$G2="Emitida"</formula></cfRule>'
         f'</conditionalFormatting>'
     )
 
-    return _inject_styles_and_cf(raw, _NFSE_TEMPLATE, cf_xml, last_data_row)
+    # --- Assemble sheet XML ---
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+        ' xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac">'
+        f'{_NFSE_SHEET_VIEW}'
+        '<sheetFormatPr defaultRowHeight="16.5" x14ac:dyDescent="0.3"/>'
+        f'{_NFSE_COLS_XML}'
+        '<sheetData>'
+        f'{header_row}{data_rows}{footer}'
+        '</sheetData>'
+        '<phoneticPr fontId="4" type="noConversion"/>'
+        f'{cf_xml}'
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>'
+        '</worksheet>'
+    )
+
+    # --- Table XML ---
+    table_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        ' id="1" name="NFSe" displayName="NFSe"'
+        f' ref="A1:M{last_data_row}" totalsRowShown="0">'
+        f'<autoFilter ref="A1:M{last_data_row}"/>'
+        '<tableColumns count="13">'
+        '<tableColumn id="1"  name="CLIENTE"/>'
+        '<tableColumn id="2"  name="NFS-e"/>'
+        '<tableColumn id="3"  name="VALOR NFS-e"/>'
+        '<tableColumn id="4"  name="DPS"/>'
+        '<tableColumn id="5"  name="CHAVE"/>'
+        '<tableColumn id="6"  name="DATA"/>'
+        '<tableColumn id="7"  name="STATUS"/>'
+        '<tableColumn id="8"  name="OBSERVAÇÕES"/>'
+        '<tableColumn id="9"  name="RETER ISS"/>'
+        '<tableColumn id="10" name="ISS"/>'
+        '<tableColumn id="11" name="RETER INSS"/>'
+        '<tableColumn id="12" name="INSS"/>'
+        '<tableColumn id="13" name="VALOR LIQUIDO"/>'
+        '</tableColumns>'
+        '<tableStyleInfo name="TableStyleMedium15" showFirstColumn="0"'
+        ' showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>'
+        '</table>'
+    )
+
+    return _build_xlsx(
+        _NFSE_TEMPLATE,
+        "NFS-e NC",
+        sheet_xml.encode("utf-8"),
+        table_xml.encode("utf-8"),
+    )

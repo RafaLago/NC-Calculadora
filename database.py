@@ -114,6 +114,44 @@ def get_last_10_entries(item, cat):
         logger.error("get_last_10_entries failed for '%s' (%s): %s", item, cat, e)
         return None
 
+def search_nf_combined(query):
+    """Searches both NF-e NC and NFS-e NC sheets and returns a unified DataFrame.
+    Adds a 'TIPO' column ('NF-e' | 'NFS-e') and a unified 'NOTA' column
+    with the invoice number so both can display in the same table.
+    Shared columns shown: OS, TIPO, NOTA, CLIENTE, TOTAL OS, VALOR, DATA, STATUS.
+    Returns empty DataFrame if query is blank or nothing found."""
+    if not query.strip():
+        return pd.DataFrame()
+
+    results = []
+
+    # NF-e NC
+    df_nfe = search_nf_sheet("NF-e NC", query)
+    if not df_nfe.empty:
+        df_nfe = df_nfe.copy()
+        df_nfe["TIPO"]  = "NF-e"
+        df_nfe["NOTA"]  = df_nfe["NF-e"].astype(str)
+        df_nfe["VALOR"] = df_nfe["VALOR NF-e"]
+        df_nfe["DATA"]  = df_nfe["EMISSÃO"]
+        results.append(df_nfe[["OS", "TIPO", "NOTA", "CLIENTE", "TOTAL OS", "VALOR", "DATA", "STATUS"]])
+
+    # NFS-e NC
+    df_nfse = search_nf_sheet("NFS-e NC", query)
+    if not df_nfse.empty:
+        df_nfse = df_nfse.copy()
+        df_nfse["TIPO"]  = "NFS-e"
+        df_nfse["NOTA"]  = df_nfse["NFS-e"].astype(str)
+        df_nfse["VALOR"] = df_nfse["VALOR NFS-e"]
+        results.append(df_nfse[["OS", "TIPO", "NOTA", "CLIENTE", "TOTAL OS", "VALOR", "DATA", "STATUS"]])
+
+    if not results:
+        return pd.DataFrame()
+
+    combined = pd.concat(results, ignore_index=True)
+    combined["OS"] = combined["OS"].astype(str).str.strip()
+    return combined.sort_values(by=["OS", "TIPO"]).reset_index(drop=True)
+
+
 def get_nf_by_month(sheet_key, year, month):
     """Returns a DataFrame filtered to a specific year/month for report generation.
     Date column is kept as datetime for Excel writing (not formatted to string).
